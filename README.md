@@ -5,6 +5,10 @@ Tested on Oracle instantclient 11.2
 
 Changes made:
 1) Fix a typo (?) in sql-stmt-exec that yields an error in (clsql:query ...)
+2) Add support for input parameters binding. Supported types are INTEGER, FLOAT,
+   VARCHAR2, CLOB, BLOB
 
 TODO:
-prepare/bind
+Bind output parameters.
+Bind by name.
+
