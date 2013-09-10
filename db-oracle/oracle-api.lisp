@@ -164,6 +164,40 @@
   (language   ub4)
   (mode       ub4))
 
+(def-oci-routine ("OCIBindByPos" oci-bind-by-pos)
+    :int
+  (stmtp      :pointer-void)
+  (bindpp     (* :pointer-void))
+  (errhp      :pointer-void)
+  (position   ub4)
+  (valuep     :pointer-void)
+  (value_sz   sb4)
+  (dty        ub2)
+  (indp       :pointer-void)
+  (alenp      (* ub2))
+  (rcodep     (* ub2)) 
+  (maxarr_len ub4)
+  (curelep    (* ub4))
+  (mode       ub4))
+
+(def-oci-routine ("OCIBindByName" oci-bind-by-name)
+    :int
+  (stmtp      :pointer-void)
+  (bindpp     (* :pointer-void))
+  (errhp      :pointer-void)
+  (placeholder (* :unsigned-char))
+  (placeh_len sb4)
+  (valuep     :pointer-void)
+  (value_sz   sb4)
+  (dty        ub2)
+  (indp       :pointer-void)
+  (alenp      (* ub2))
+  (rcodep     (* ub2)) 
+  (maxarr_len ub4)
+  (curelep    (* ub4))
+  (mode       ub4))
+
+
 (def-oci-routine ("OCIStmtExecute" oci-stmt-execute)
     :int
   (svchp      :pointer-void)
@@ -254,6 +288,7 @@
 
 
 
+
 ;;; Low-level routines that don't do error checking. They are used
 ;;; for setting up global environment.
 
@@ -280,6 +315,15 @@
      (xtramem_sz   size_t)                      ; size_t
      (usrmempp     (* :pointer-void)))
   :returning :int)
+
+(uffi:def-function "OCIDescriptorAlloc"
+    ((parenth    :pointer-void)                      ; OCIEnv *
+     (descpp     (* :pointer-void))
+     (type       ub4)
+     (xtramem_sz size_t)
+     (usrmempp   (* :pointer-void)))
+  :returning :int)
+
 
 (defstruct oci-handle
   (type :unknown)

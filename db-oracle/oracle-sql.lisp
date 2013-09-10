@@ -54,7 +54,11 @@ likely that we'll have to worry about the CMUCL limit."))
   (defconstant SQLT-INT 3)
   (defconstant SQLT-FLT 4)
   (defconstant SQLT-STR 5)
-  (defconstant SQLT-DATE 12))
+  (defconstant SQLT-LNG 8)
+  (defconstant SQLT-DATE 12)
+  (defconstant SQLT-BIN 23)
+  (defconstant SQLT-CLOB 112)
+  (defconstant SQLT-BLOB 113))
 
 ;;; Note that despite the suggestive class name (and the way that the
 ;;; *DEFAULT-DATABASE* variable holds an object of this class), a DB
@@ -889,12 +893,13 @@ the length of that format.")
 ;;; The TYPES argument controls the type conversion method used
 ;;; to construct the table. The Allegro version supports several possible
 ;;; values for this argument, but we only support :AUTO.
+;;;
+;;; Process-cursor is a helper function what does all the work.
 
-(defmethod database-query (query-expression (database oracle-database) result-types field-names)
-  (let ((cursor (sql-stmt-exec query-expression database result-types field-names)))
-    ;; (declare (type (or query-cursor null) cursor))
-    (if (null cursor) ; No table was returned.
-        (values)
+(defun process-cursor (cursor database field-names)
+  ;; (declare (type (or query-cursor null) cursor))
+  (if (null cursor) ; No table was returned.
+      (values)
       (do ((reversed-result nil))
           (nil)
         (let* ((eof-value :eof)
@@ -904,10 +909,13 @@ the length of that format.")
             (if field-names
                 (return (values (nreverse reversed-result)
                                 (loop for cd across (qc-cds cursor)
-                                    collect (cd-name cd))))
-              (return (nreverse reversed-result))))
-          (push row reversed-result))))))
+                                   collect (cd-name cd))))
+                (return (nreverse reversed-result))))
+          (push row reversed-result)))))
 
+(defmethod database-query (query-expression (database oracle-database) result-types field-names)
+  (let ((cursor (sql-stmt-exec query-expression database result-types field-names)))
+    (process-cursor cursor database field-names)))
 
 (defmethod database-create-sequence (sequence-name (database oracle-database))
   (execute-command
@@ -1072,3 +1080,144 @@ the length of that format.")
 
 (when (clsql-sys:database-type-library-loaded :oracle)
   (clsql-sys:initialize-database-type :database-type :oracle))
+
+;;; ================= Prepare/bind =================
+
+(defclass oracle-stmt ()
+  ((database :initarg :database :reader database)
+   (oci-stmthp :initarg :oci-stmthp :reader oci-stmthp) ; statement handle pointer
+   (bindings :initform nil :reader bindings)
+   (binding-types :initarg :binding-types :reader binding-types)
+   (select-p :initarg :select-p :reader select-p)
+   (field-names :initarg :field-names :accessor stmt-field-names)
+   (result-types :initarg :result-types :reader result-types)))
+
+(defun clsql-type->oracle-sqlt (type)
+  (cond
+    ((in type :int :integer :short :bigint) SQLT-INT)
+    ((in type :float :double :number) SQLT-FLT)
+    ((in type :clob) SQLT-LNG)
+    ((in type :blob) SQLT-BIN)
+    ((or (in type :string)
+         (and (consp type) (in (car type) :char :varchar))) SQLT-STR)
+    (t
+     (error 'sql-user-error
+            :message
+            (format nil "Unknown clsql type ~A." type)))))
+
+
+(defmethod database-prepare (sql-stmt types (database oracle-database) result-types field-names)
+  (with-slots (envhp svchp errhp) database
+    (uffi:with-foreign-strings ((c-stmt-string sql-stmt))
+      (let ((stmthp (uffi:allocate-foreign-object :pointer-void))
+            select-p)
+
+        (uffi:with-foreign-object (stmttype :unsigned-short)
+          (oci-handle-alloc (deref-vp envhp)
+                            stmthp
+                            +oci-htype-stmt+ 0 +null-void-pointer-pointer+)
+          (oci-stmt-prepare (deref-vp stmthp)
+                            (deref-vp errhp)
+                            c-stmt-string
+                            (uffi:foreign-string-length c-stmt-string)
+                            +oci-ntv-syntax+ +oci-default+ :database database)
+          (oci-attr-get (deref-vp stmthp)
+                        +oci-htype-stmt+
+                        stmttype
+                        +unsigned-int-null-pointer+
+                        +oci-attr-stmt-type+
+                        (deref-vp errhp)
+                        :database database)
+
+          (setq select-p (= (uffi:deref-pointer stmttype :unsigned-short) 1))
+
+          (make-instance 'oracle-stmt
+                         :database database
+                         :oci-stmthp stmthp
+                         :select-p select-p
+                         :binding-types types
+                         :result-types result-types
+                         :field-names field-names))))))
+
+
+(defmethod database-bind-parameter ((stmt oracle-stmt) position value)
+  (with-slots (database id oci-stmthp bindings binding-types field-names result-types) stmt
+    (with-slots (envhp svchp errhp) database
+      (let* ((bindp (uffi:allocate-foreign-object :pointer-void))
+             c-value c-value-size
+             (binding-type (elt binding-types (1- position))) ; user-suplied type of value
+             (sqlt (clsql-type->oracle-sqlt binding-type))) ; Oracle's type for clsql binding-type
+
+        (case binding-type
+          ((:string :clob)
+           (setf c-value (uffi:convert-to-foreign-string value)
+                 c-value-size (1+ (uffi:foreign-string-length c-value))))
+          (:blob
+           (setf c-value-size (length value)
+                 c-value (uffi:allocate-foreign-object :unsigned-char c-value-size))
+           (dotimes (i c-value-size)
+             (setf (uffi:deref-array c-value :unsigned-char i) (elt value i))))
+          ((:int :integer :short :bigint)
+           (setf c-value (uffi:allocate-foreign-object :int)
+                 c-value-size 4) ; sizeof(int)
+           (setf (uffi:deref-pointer c-value :int) value))
+          ((:float :double :numeric)
+           (setf c-value (uffi:allocate-foreign-object :double)
+                 c-value-size 8) ; sizeof(double)
+           (setf (uffi:deref-pointer c-value :double) value))
+          (t
+           (error 'sql-database-error
+                  :message
+                  (format nil "Unsupported bind parameter type."))))
+
+        (setf (deref-vp bindp) +null-void-pointer+)
+        (oci-bind-by-pos (deref-vp oci-stmthp)
+                         bindp
+                         (deref-vp errhp)
+                         position
+                         c-value
+                         c-value-size
+                         sqlt ;;-- type of value
+                         +null-void-pointer+ ;; indp
+                         +unsigned-short-null-pointer+ ;; alenp
+                         +unsigned-short-null-pointer+ ;; rcodep
+                         0 ;; maxarr_len
+                         +unsigned-int-null-pointer+ ;; curelep
+                         +oci-default+ :database database)
+
+        (push (cons position c-value) bindings))
+      t)))
+
+
+;; This function has the same prototype as sql-stmt-exec.
+(defun sql-prepared-stmt-exec (stmt database result-types field-names)
+  "Return cursor if statement is a select query and NIL otherwise."
+  (with-slots (oci-stmthp select-p) stmt
+    (with-slots (envhp svchp errhp) database
+      (let ((iters (if select-p 0 1)))
+
+        (oci-stmt-execute (deref-vp svchp)
+                          (deref-vp oci-stmthp)
+                          (deref-vp errhp)
+                          iters 0 +null-void-pointer+ +null-void-pointer+ +oci-default+
+                          :database database)
+        (cond
+          (select-p
+           (make-query-cursor database oci-stmthp result-types field-names))
+          (t
+           nil))))))
+
+
+;; The code is exactly the same as in database-query method, but first call
+;; is to sql-prepared-stmt-exec insted of sql-stmt-exec.
+;;
+(defmethod database-run-prepared ((stmt oracle-stmt))
+  (with-slots (database field-names result-types bindings) stmt
+    (prog1
+        (let ((cursor (sql-prepared-stmt-exec stmt database result-types field-names)))
+          (process-cursor cursor database field-names))
+      (dolist (binding bindings)
+        (uffi:free-foreign-object (cdr binding))))))
+
+(defmethod db-type-has-prepared-stmt? ((db-type (eql :oracle)))
+  t)
